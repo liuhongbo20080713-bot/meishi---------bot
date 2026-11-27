@@ -5843,16 +5843,35 @@ class MeishiBotGUI:
                 bg_move(hwnd, x, y)
                 time.sleep(0.006)
 
+    def _park_cursor_left(self, ctx=None):
+        """将后台虚拟鼠标移至窗口最左侧边缘（不动真实鼠标），防止一局结束回房后悬停触发老鼠详情介绍挡住【开始】按钮"""
+        hwnd = self._ctx_hwnd(ctx)
+        if not hwnd or not user32.IsWindow(hwnd):
+            return
+        try:
+            l, t, r, b = get_window_rect(hwnd)
+            ih = max(200, b - t)
+            bg_move(hwnd, 8, ih // 3)
+        except Exception:
+            bg_move(hwnd, 8, 300)
+
     def _exec_finish_sequence(self, token=None, ctx=None):
         hwnd = self._ctx_hwnd(ctx)
         pfx = self._ctx_prefix(ctx)
         self.log(f"{pfx}>>> 执行【全关卡通用 · 战斗结束翻牌与收尾】...")
-        for step in self.config.get("finish_extra_clicks", []):
+        steps = self.config.get("finish_extra_clicks", [])
+        for idx, step in enumerate(steps):
             if not self._is_active(token):
                 return
             bg_click(hwnd, step["x"], step["y"])
             self.log(f"  {pfx}[收尾] 后台点击 {step['name']} ({step['x']}, {step['y']})")
+            # 最后一步（通常是【完成】）点完立刻把虚拟鼠标移到最左侧，避免回房时悬停到老鼠详情页遮挡【开始】
+            if idx == len(steps) - 1:
+                time.sleep(0.05)
+                self._park_cursor_left(ctx=ctx)
             self._sleep_interruptible(float(step.get("delay", 1.5)), token)
+        if self._is_active(token):
+            self._park_cursor_left(ctx=ctx)
 
     # ==================== 主状态机 ====================
     def _refresh_clear_count_ui(self):
@@ -6381,6 +6400,8 @@ class MeishiBotGUI:
                                 repair_state.clear()
                                 last_stage_scan_ts = 0.0
                                 self._sleep_interruptible(2.0, my_token)
+                                if self._is_active(my_token):
+                                    self._park_cursor_left(ctx=ctx)
                                 continue
 
                             # 2.5 战斗失败兜底（翻车时自动点回房/重开，不计入刷关次数）
@@ -6393,11 +6414,15 @@ class MeishiBotGUI:
                                     self.log(f"{pfx}💀 检测到【战斗失败】(匹配度={f_score:.2f})，自动点击 ({fx}, {fy}) 返回重开！")
                                     _set_prog("失败重开")
                                     bg_click(hwnd, fx, fy)
+                                    time.sleep(0.05)
+                                    self._park_cursor_left(ctx=ctx)
                                     place_idx = 0
                                     first_pass_done = False
                                     repair_state.clear()
                                     last_stage_scan_ts = 0.0
                                     self._sleep_interruptible(2.5, my_token)
+                                    if self._is_active(my_token):
+                                        self._park_cursor_left(ctx=ctx)
                                     continue
 
                             # 3. 选卡 / 组队房间同步界面
@@ -6498,7 +6523,8 @@ class MeishiBotGUI:
                                 my_token, ctx, cur_deck, active_steps, repair_state, _set_prog, max_slice_s=0.45
                             )
                             if r_ret == "modal":
-                                # 检测到顶栏变暗/弹窗切屏，立刻清零扫描计时器，下一拍马上检测结算/继续战斗！
+                                # 检测到顶栏变暗/弹窗切屏/离场回房，先将虚拟鼠标移到最左侧防悬停弹窗，立刻切回阶段检测！
+                                self._park_cursor_left(ctx=ctx)
                                 last_stage_scan_ts = 0.0
                                 self._sleep_interruptible(0.12, my_token)
                                 continue
@@ -6558,6 +6584,7 @@ class MeishiBotGUI:
                         should_verify = bool(opts.get("verify_placed", True)) and (not first_pass_done)
                         res_status = self._exec_single_placement(step, verify=should_verify, ctx=ctx)
                         if res_status == "modal":
+                            self._park_cursor_left(ctx=ctx)
                             last_stage_scan_ts = 0.0
                             self._sleep_interruptible(0.12, my_token)
                             continue
