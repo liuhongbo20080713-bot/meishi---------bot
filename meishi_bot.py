@@ -1547,6 +1547,161 @@ class FireEnergyOCR:
 FIRE_OCR = FireEnergyOCR(FIRE_DIGIT_DIR)
 
 
+def auto_locate_fire_roi(img: Image.Image, deck_cards: list = None, viewport_box=None):
+    """
+    自动定位战斗画面左上角【火苗数字框】[l, t, r, b]（耗时 ~5-15ms，适配任意分辨率与任意带卡数量）：
+    四重联合特征：
+      1. 位于画面顶部左侧栏（优先在首张卡片左侧窄带内搜索，未命中时自动扩大到左上 60%×28%）；
+      2. 米白色水平圆角矩形框（宽长比 1.65~5.5，填充度 >= 0.42）；
+      3. 正上方紧贴亮橙金火苗徽章圆盘，周边紧邻蓝色顶栏边框；
+      4. 框内数字必须通过 FIRE_OCR 清晰识别为合法整数（排除卡费与其他无关白块）。
+    返回: (roi_box [l, t, r, b], fire_val, score) 或 (None, None, -1.0)
+    """
+    if img is None:
+        return None, None, -1.0
+    iw, ih = img.size
+    if iw < 200 or ih < 120:
+        return None, None, -1.0
+
+    vp = viewport_box
+    if not vp or len(vp) != 4:
+        try:
+            vp = auto_detect_game_viewport(img)
+        except Exception:
+            vp = None
+    vx0, vy0, vx1, vy1 = vp if (vp and len(vp) == 4) else (0, 0, iw, ih)
+    vw = max(200, vx1 - vx0)
+    vh = max(120, vy1 - vy0)
+
+    min_card_x = None
+    if deck_cards:
+        cxs = [int(c["x"]) for c in deck_cards if "x" in c and "铲" not in c.get("name", "")]
+        if cxs:
+            min_card_x = min(cxs)
+
+    def _scan_region(sx0: int, sy0: int, sx1: int, sy1: int, enforce_left_of_card: bool):
+        sx0, sy0 = max(0, sx0), max(0, sy0)
+        sx1, sy1 = min(iw, sx1), min(ih, sy1)
+        if sx1 - sx0 < 40 or sy1 - sy0 < 25:
+            return None, None, -1.0
+
+        crop_rgb = np.asarray(img.crop((sx0, sy0, sx1, sy1)).convert("RGB"), dtype=np.float32)
+        r, g, b = crop_rgb[:, :, 0], crop_rgb[:, :, 1], crop_rgb[:, :, 2]
+        cream = (
+            (r > 175.0)
+            & (g > 170.0)
+            & (b > 130.0)
+            & (np.abs(r - g) < 32.0)
+            & ((r - b) > -20.0)
+            & ((r - b) < 68.0)
+        )
+        sh, sw = cream.shape
+        ds = max(2, sw // 180) if (sw >= 220 and sh >= 100) else 1
+        c_ds = cream[::ds, ::ds]
+        dh, dw = c_ds.shape
+        vis = np.zeros((dh, dw), dtype=np.uint8)
+        boxes = []
+        ys_all, xs_all = np.where(c_ds)
+        for idx in range(len(ys_all)):
+            y0 = int(ys_all[idx])
+            x0 = int(xs_all[idx])
+            if vis[y0, x0]:
+                continue
+            stack = [(y0, x0)]
+            vis[y0, x0] = 1
+            min_y = max_y = y0
+            min_x = max_x = x0
+            area = 0
+            while stack:
+                cy, cx = stack.pop()
+                area += 1
+                if cy < min_y:
+                    min_y = cy
+                if cy > max_y:
+                    max_y = cy
+                if cx < min_x:
+                    min_x = cx
+                if cx > max_x:
+                    max_x = cx
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < dh and 0 <= nx < dw and not vis[ny, nx] and c_ds[ny, nx]:
+                        vis[ny, nx] = 1
+                        stack.append((ny, nx))
+            bw = (max_x - min_x + 1) * ds
+            bh = (max_y - min_y + 1) * ds
+            if bw < max(28, int(vw * 0.025)) or bw > int(vw * 0.12):
+                continue
+            if bh < max(10, int(vh * 0.014)) or bh > int(vh * 0.065):
+                continue
+            aspect = bw / float(bh)
+            if aspect < 1.65 or aspect > 5.5:
+                continue
+            fill = (area * ds * ds) / float(bw * bh)
+            if fill < 0.42:
+                continue
+            boxes.append((min_x * ds, min_y * ds, min(sw, (max_x + 1) * ds), min(sh, (max_y + 1) * ds), aspect))
+
+        best = (None, None, -1.0)
+        for bx0, by0, bx1, by1, aspect in boxes:
+            bw = bx1 - bx0
+            bh = by1 - by0
+            above_y0 = max(0, by0 - int(bh * 2.8))
+            above_y1 = max(0, by0 - 2)
+            if above_y1 - above_y0 < max(6, bh // 2):
+                continue
+            above = crop_rgb[above_y0:above_y1, bx0:bx1]
+            ar, ag, ab = above[:, :, 0], above[:, :, 1], above[:, :, 2]
+            flame_gold = float(((ar > 195.0) & (ag > 130.0) & ((ar - ab) > 45.0)).mean())
+            medallion_bright = float(((ar > 180.0) & (ag > 165.0) & (ab > 120.0)).mean())
+            if flame_gold < 0.04 or medallion_bright < 0.12:
+                continue
+
+            ring_x0 = max(0, bx0 - max(6, bw // 6))
+            ring_x1 = min(sw, bx1 + max(6, bw // 6))
+            ring_y0 = max(0, by0 - 4)
+            ring_y1 = min(sh, by1 + max(6, bh // 2))
+            ring = crop_rgb[ring_y0:ring_y1, ring_x0:ring_x1]
+            rr, rb = ring[:, :, 0], ring[:, :, 2]
+            blue_bar = float(((rb > 110.0) & ((rb - rr) > 28.0)).mean())
+            if blue_bar < 0.04:
+                continue
+
+            pad_x = max(3, int(bw * 0.06))
+            pad_y = max(3, int(bh * 0.14))
+            gl = max(0, sx0 + bx0 - pad_x)
+            gt = max(0, sy0 + by0 - pad_y)
+            gr = min(iw, sx0 + bx1 + pad_x)
+            gb = min(ih, sy0 + by1 + pad_y)
+            val, ocr_sc, gcnt = FIRE_OCR.read_number(img.crop((gl, gt, gr, gb)))
+            if val is None or ocr_sc < 0.48 or gcnt < 1 or gcnt > 5:
+                continue
+
+            score = ocr_sc * 2.0 + min(0.5, flame_gold * 2.0) + min(0.3, blue_bar * 1.5)
+            if 2.2 <= aspect <= 4.2:
+                score += 0.25
+            if enforce_left_of_card and min_card_x is not None:
+                if gr <= min_card_x + 15:
+                    dist = min_card_x - gr
+                    if 0 <= dist <= max(240, int(vw * 0.16)):
+                        score += 0.5
+                else:
+                    score -= 0.85
+            if score > best[2]:
+                best = ([gl, gt, gr, gb], val, score)
+        return best
+
+    # Pass 1: 若有已录卡片，先在首张卡紧左侧窄带内极速搜索 (~3ms)
+    if min_card_x is not None:
+        nx0 = max(vx0, min_card_x - int(vw * 0.28))
+        nx1 = min(vx1, min_card_x + 20)
+        res1 = _scan_region(nx0, vy0, nx1, vy0 + int(vh * 0.28), enforce_left_of_card=True)
+        if res1[0] is not None:
+            return res1
+
+    # Pass 2: 兜底扫描整个游戏画面左上区域（兼容未录卡组或换卡数大幅偏移场景）
+    return _scan_region(vx0, vy0, vx0 + int(vw * 0.60), vy0 + int(vh * 0.28), enforce_left_of_card=False)
+
+
 def _make_blank_deck() -> dict:
     return {
         "enter_clicks": [],
@@ -1720,6 +1875,7 @@ class MeishiBotGUI:
         self._update_checking = False
         self._refresh_window_list()
         self._refresh_deck_ui()
+        self._sync_target_clears_ui()
         self._start_hotkey_listener()
         self._start_live_preview_loop()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2282,9 +2438,10 @@ class MeishiBotGUI:
         ttk.Button(row2, text="📂导入", width=6, command=self._import_deck).pack(side="left", padx=1)
         ttk.Button(row2, text="🚀测开战", width=7, command=self._test_run_enter).pack(side="left", padx=3)
         self.lbl_fire_live = ttk.Label(
-            row2, text="🔥火苗:未框选", foreground="#e65100", font=("Microsoft YaHei", 9, "bold")
+            row2, text="🔥火苗:进战自动锁", foreground="#e65100", font=("Microsoft YaHei", 9, "bold")
         )
         self.lbl_fire_live.pack(side="left", padx=4)
+        ttk.Button(row2, text="🔍寻火", width=6, command=self._manual_auto_locate_fire_roi).pack(side="left", padx=1)
         ttk.Button(row2, text="🎯校准", width=6, command=self._open_fire_calibrate_dialog).pack(side="left", padx=1)
 
         # 2. 优先固定底部控制与日志区（防止高分屏窗口缩放时启动按钮被挤出屏幕底部）
@@ -2333,6 +2490,17 @@ class MeishiBotGUI:
         )
         self.lbl_clear_count.pack(side="left", padx=6)
         ttk.Button(ctrl_bar, text="清零", width=4, command=self._reset_clear_count).pack(side="left", padx=2)
+        ttk.Label(ctrl_bar, text="目标:", font=("Microsoft YaHei", 9)).pack(side="left", padx=(4, 1))
+        self.var_target_clears = tk.StringVar(value="0")
+        self.spn_target_clears = ttk.Spinbox(
+            ctrl_bar, from_=0, to=9999, width=4, textvariable=self.var_target_clears,
+            command=self._on_target_clears_change,
+        )
+        self.spn_target_clears.pack(side="left", padx=1)
+        self.spn_target_clears.bind("<Return>", lambda _: self._on_target_clears_change())
+        self.spn_target_clears.bind("<FocusOut>", lambda _: self._on_target_clears_change())
+        self.spn_target_clears.bind("<KeyRelease>", lambda _: self._on_target_clears_change(silent_invalid=True))
+        ttk.Label(ctrl_bar, text="(0无限)", foreground="#777777", font=("Microsoft YaHei", 8)).pack(side="left", padx=(1, 4))
         self.lbl_bot_progress = ttk.Label(
             ctrl_bar, text="执行进度：未运行", foreground="#d84315", font=("Microsoft YaHei", 9, "bold")
         )
@@ -2555,6 +2723,7 @@ class MeishiBotGUI:
             variable=self.var_insert_after,
         ).pack(side="left", padx=2)
         ttk.Button(erow3, text="📐对齐新浏览器坐标", command=self._open_rescale_coords_dialog).pack(side="right", padx=2)
+        ttk.Button(erow3, text="🔄批量换卡", command=self._batch_replace_place_card).pack(side="right", padx=2)
 
         # 放卡步骤列表（自动填充中间剩余高度）
         self.tree_place = ttk.Treeview(
@@ -2578,6 +2747,7 @@ class MeishiBotGUI:
         self.place_menu.add_command(label="🎯 移动到指定序号...", command=self._move_place_to_index)
         self.place_menu.add_command(label="📋 在下方复制这一步", command=self._duplicate_place_step)
         self.place_menu.add_command(label="🔁 设补阵替换卡（复制卡改补本体）...", command=self._set_place_repair_card)
+        self.place_menu.add_command(label="🔄 将本卡所有落点批量换为...", command=self._batch_replace_place_card)
         self.place_menu.add_command(label="⏯ 启用 / 禁用", command=self._toggle_place_enabled)
         self.place_menu.add_separator()
         self.place_menu.add_command(label="🗑 删除这一步", command=self._del_place_step)
@@ -4237,6 +4407,118 @@ class MeishiBotGUI:
         self.save_config()
         self.log(f"✅ 已修改第 {idx+1} 步：改为点击【{p['card_name']}】放到 ({nx}, {ny})，间隔 {nd}s")
 
+    def _batch_replace_place_card(self):
+        """一键将当前方案布阵中某张旧卡的全部落点（及可选的补阵替换指向）批量替换为另一张卡"""
+        deck = self.get_cur_deck()
+        placements = deck.get("placements") or []
+        if not placements:
+            messagebox.showinfo("提示", "当前方案还没有任何放卡步骤！")
+            return
+        lib_names = [c["name"] for c in deck.get("cards", []) if c.get("name")]
+        if not lib_names:
+            messagebox.showinfo("提示", "请先在【1.卡片库】录入你要替换成的目标新卡！")
+            return
+
+        # 统计布阵与补阵替换中出现过的所有卡名（即使旧卡已从卡片库删掉也能选中替换！）
+        used_counts = {}
+        for p in placements:
+            cn = p.get("card_name", "")
+            if cn:
+                used_counts[cn] = used_counts.get(cn, 0) + 1
+            rc = p.get("repair_card", "")
+            if rc and rc != "__skip__" and rc not in used_counts:
+                used_counts[rc] = 0
+        old_choices = [f"{nm}（布阵 {cnt} 步）" for nm, cnt in used_counts.items()]
+        old_raw_list = list(used_counts.keys())
+
+        # 若当前选中了某一行，自动预选该行的卡名作为“原卡片”
+        default_old_idx = 0
+        sel = self.tree_place.selection()
+        if sel:
+            s_idx = self.tree_place.index(sel[0])
+            if 0 <= s_idx < len(placements):
+                s_cn = placements[s_idx].get("card_name", "")
+                if s_cn in old_raw_list:
+                    default_old_idx = old_raw_list.index(s_cn)
+
+        win = tk.Toplevel(self.root)
+        win.title("🔄 批量换卡（一键替换某张卡的全部落点）")
+        win.resizable(False, False)
+        th = self._cur_theme()
+        win.configure(bg=th["card"])
+        apply_win11_titlebar(win, th)
+        win.transient(self.root)
+        win.grab_set()
+
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="改卡组后无需重录坐标！将当前方案中旧卡的所有放卡点一次性换为新卡：",
+            foreground=th["tip_fg"],
+        ).pack(anchor="w", pady=(0, 8))
+
+        r1 = ttk.Frame(body)
+        r1.pack(fill="x", pady=4)
+        ttk.Label(r1, text="要被替换的旧卡：", width=16).pack(side="left")
+        var_old = tk.StringVar(value=old_choices[default_old_idx])
+        cb_old = ttk.Combobox(r1, textvariable=var_old, values=old_choices, width=24, state="readonly")
+        cb_old.pack(side="left", fill="x", expand=True)
+
+        r2 = ttk.Frame(body)
+        r2.pack(fill="x", pady=4)
+        ttk.Label(r2, text="全部替换为新卡：", width=16).pack(side="left")
+        default_new = next((n for n in lib_names if n != old_raw_list[default_old_idx]), lib_names[0])
+        var_new = tk.StringVar(value=default_new)
+        cb_new = ttk.Combobox(r2, textvariable=var_new, values=lib_names, width=24, state="readonly")
+        cb_new.pack(side="left", fill="x", expand=True)
+
+        var_sync_repair = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            body,
+            text="同时把复制卡（百变/幻鸡）指向该旧卡的【补阵替换卡】也一并改为新卡",
+            variable=var_sync_repair,
+        ).pack(anchor="w", pady=(6, 4))
+
+        def do_replace():
+            oi = cb_old.current()
+            if oi < 0 or oi >= len(old_raw_list):
+                return
+            old_nm = old_raw_list[oi]
+            new_nm = var_new.get().strip()
+            if not new_nm:
+                return
+            if old_nm == new_nm:
+                messagebox.showinfo("提示", "旧卡与新卡名称相同，无需替换！", parent=win)
+                return
+            changed_steps = 0
+            changed_repairs = 0
+            sync_rep = bool(var_sync_repair.get())
+            for p in placements:
+                if p.get("card_name") == old_nm:
+                    p["card_name"] = new_nm
+                    changed_steps += 1
+                if sync_rep and p.get("repair_card") == old_nm:
+                    p["repair_card"] = new_nm
+                    changed_repairs += 1
+            self._reload_place_tree()
+            self._redraw_canvas_overlays()
+            self.save_config()
+            extra = f"（另同步更新 {changed_repairs} 个补阵替换指向）" if changed_repairs else ""
+            self.log(f"🔄 批量换卡完成：已将全部 {changed_steps} 步【{old_nm}】替换为【{new_nm}】{extra}！")
+            win.destroy()
+
+        bf = ttk.Frame(body)
+        bf.pack(fill="x", pady=(10, 0))
+        ttk.Button(bf, text="✔ 确认全部替换", command=do_replace).pack(side="left", padx=4)
+        ttk.Button(bf, text="取消", command=win.destroy).pack(side="left", padx=4)
+        win.bind("<Return>", lambda _e: do_replace())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.update_idletasks()
+        px = self.root.winfo_x() + max(20, (self.root.winfo_width() - win.winfo_width()) // 2)
+        py = self.root.winfo_y() + max(20, (self.root.winfo_height() - win.winfo_height()) // 2)
+        win.geometry(f"+{px}+{py}")
+
     def _move_place_step(self, delta: int):
         sel = self.tree_place.selection()
         if not sel:
@@ -4771,6 +5053,7 @@ class MeishiBotGUI:
             self.save_config(silent=True)
             if switch_window:
                 self._switch_to_account_window(acc, warn_if_missing=False)
+            self._sync_target_clears_ui()
             self._refresh_run_buttons(refresh_tree=False)
             self.log(f"👤 已切换到账号【{acc.get('name', '')}】专属卡组库（当前方案：{nxt_deck}，共 {len(decks)} 套方案）")
         finally:
@@ -5302,11 +5585,16 @@ class MeishiBotGUI:
 
     def _ctx_fire_roi(self, ctx=None):
         """
-        火苗监测区三级优先级（因为同一账号带 10/12/13/14 张卡时顶栏宽度不同，火苗框都会左右偏移！）：
-        1. 当前卡组方案专属 deck["fire_ocr_roi"]（最精准，不同带卡数的方案互不干扰）
-        2. 当前账号默认 acc["fire_ocr_roi"]
-        3. 全局兜底 config["fire_ocr_roi"]
+        火苗监测区四级优先级（每局进战斗自动锁定最准，适配不同卡数与分辨率）：
+        1. 本局进战斗自动锁定的 ctx["auto_fire_roi"]
+        2. 当前卡组方案专属 deck["fire_ocr_roi"]
+        3. 当前账号默认 acc["fire_ocr_roi"]
+        4. 全局兜底 config["fire_ocr_roi"]
         """
+        if ctx:
+            auto_r = ctx.get("auto_fire_roi")
+            if auto_r and len(auto_r) == 4:
+                return auto_r
         deck = self._ctx_deck(ctx)
         d_roi = deck.get("fire_ocr_roi")
         if d_roi and len(d_roi) == 4:
@@ -5321,6 +5609,51 @@ class MeishiBotGUI:
             if a_roi and len(a_roi) == 4:
                 return a_roi
         return self.config.get("fire_ocr_roi")
+
+    def _auto_lock_fire_roi_for_battle(self, ctx=None, screen: Image.Image = None, save_to_deck: bool = True):
+        """进入战斗后自动定位并锁定本局火苗数字框 [l, t, r, b]，返回 (roi, fire_val) 或 (None, None)"""
+        hwnd = self._ctx_hwnd(ctx)
+        cap = self._ctx_cap(ctx)
+        img = screen if screen is not None else (cap.capture_full(hwnd) if (hwnd and user32.IsWindow(hwnd)) else None)
+        if img is None:
+            return None, None
+        cur_deck = self._ctx_deck(ctx)
+        roi, val, _ = auto_locate_fire_roi(img, deck_cards=cur_deck.get("cards"))
+        if roi is None:
+            return None, None
+        if ctx is not None:
+            ctx["auto_fire_roi"] = list(roi)
+        if save_to_deck:
+            old_r = cur_deck.get("fire_ocr_roi")
+            if old_r != list(roi):
+                cur_deck["fire_ocr_roi"] = list(roi)
+                try:
+                    self.root.after(0, lambda: self.save_config(silent=True))
+                except Exception:
+                    pass
+        ctx_aid = ctx.get("acc_id", "") if ctx else ""
+        if (not ctx_aid) or (ctx_aid == self.config.get("active_account_id")):
+            self.latest_fire_val = val
+            try:
+                self.root.after(0, lambda v=val: (self.lbl_fire_live.config(text=f"🔥 实时火苗: {v}"), self._redraw_canvas_overlays()))
+            except Exception:
+                pass
+        pfx = self._ctx_prefix(ctx)
+        self.log(f"{pfx}🎯 [自动锁火苗] 本局已自动锁定火苗位置 {roi}（当前火苗: {val}）")
+        return roi, val
+
+    def _manual_auto_locate_fire_roi(self):
+        """手动点击【🔍寻火】立即自动扫描当前战斗画面并锁定火苗区"""
+        img = CAPTURER.capture_full(self.hwnd) or self.current_pil_img
+        if img is None:
+            messagebox.showinfo("提示", "尚未获取到游戏画面，请先打开游戏并进入战斗！")
+            return
+        roi, val = self._auto_lock_fire_roi_for_battle(ctx=None, screen=img, save_to_deck=True)
+        if roi is None:
+            messagebox.showinfo("未检测到战斗火苗框", "当前画面未识别到战斗左上角的火苗数字框。\n请在【已进入战斗且顶栏可见】时再试，或右键手动框选。")
+        else:
+            self._redraw_canvas_overlays()
+            messagebox.showinfo("自动锁定成功", f"已自动定位并锁定火苗区：{roi}\n当前识别火苗数值：{val}\n\n（挂机时每次进入战斗也会自动重新锁定！）")
 
     def _ctx_card(self, card_name: str, ctx=None):
         for c in self._ctx_deck(ctx).get("cards", []):
@@ -5874,23 +6207,89 @@ class MeishiBotGUI:
             self._park_cursor_left(ctx=ctx)
 
     # ==================== 主状态机 ====================
+    def _get_target_clears_for_key(self, key: str = "", acc: dict = None) -> int:
+        """读取指定账号预设的目标刷关次数（0 = 无限刷）"""
+        if isinstance(acc, dict):
+            try:
+                return max(0, int(acc.get("target_clears", 0) or 0))
+            except Exception:
+                return 0
+        if key and key != "default":
+            for a in self.config.get("accounts") or []:
+                if a.get("id") == key:
+                    try:
+                        return max(0, int(a.get("target_clears", 0) or 0))
+                    except Exception:
+                        return 0
+        _, owner, _ = self._get_active_decks_store()
+        try:
+            return max(0, int(owner.get("target_clears", self.config.get("target_clears", 0)) or 0))
+        except Exception:
+            return 0
+
+    def _sync_target_clears_ui(self):
+        """切换账号或启动时同步底部【目标】刷关次数输入框与显示"""
+        if not hasattr(self, "var_target_clears"):
+            return
+        _, owner, _ = self._get_active_decks_store()
+        try:
+            val = max(0, int(owner.get("target_clears", self.config.get("target_clears", 0)) or 0))
+        except Exception:
+            val = 0
+        self.var_target_clears.set(str(val))
+        self._refresh_clear_count_ui()
+
+    def _on_target_clears_change(self, silent_invalid: bool = False):
+        """实时保存当前账号的预设刷关次数（支持挂机中途动态修改，0=无限）"""
+        raw = (self.var_target_clears.get() if hasattr(self, "var_target_clears") else "").strip()
+        if raw == "":
+            if silent_invalid:
+                return
+            val = 0
+        else:
+            try:
+                val = max(0, min(9999, int(raw)))
+            except ValueError:
+                if silent_invalid:
+                    return
+                val = 0
+        _, owner, _ = self._get_active_decks_store()
+        old_val = int(owner.get("target_clears", 0) or 0)
+        owner["target_clears"] = val
+        if owner is self.config:
+            self.config["target_clears"] = val
+        if not silent_invalid:
+            self.var_target_clears.set(str(val))
+        if val != old_val:
+            self.save_config(silent=True)
+        self._refresh_clear_count_ui()
+
     def _refresh_clear_count_ui(self):
-        """按账号分别展示刷关次数：单号显示【账号名: X 次】，多号并排显示【号A:X | 号B:Y】"""
+        """按账号分别展示刷关次数与目标进度：单号显示【账号名: 3/10 次】，多号并排显示【号A:3/10 | 号B:2】"""
         if not hasattr(self, "lbl_clear_count"):
             return
         with self._team_lock:
             items = [
-                (self._account_clear_names.get(k, k), cnt)
+                (k, self._account_clear_names.get(k, k), cnt)
                 for k, cnt in self._account_clear_counts.items()
                 if cnt > 0
             ]
         if not items:
-            txt = "🏆 已刷: 0 次"
+            cur_k, cur_acc, _ = self._get_current_run_key()
+            tgt = self._get_target_clears_for_key(cur_k, acc=cur_acc)
+            txt = f"🏆 已刷: 0/{tgt} 次" if tgt > 0 else "🏆 已刷: 0 次"
         elif len(items) == 1:
-            nm, cnt = items[0]
-            txt = f"🏆 {nm}: {cnt} 次" if (nm and nm != "default") else f"🏆 已刷: {cnt} 次"
+            k, nm, cnt = items[0]
+            tgt = self._get_target_clears_for_key(k)
+            frac = f"{cnt}/{tgt}" if tgt > 0 else f"{cnt}"
+            txt = f"🏆 {nm}: {frac} 次" if (nm and nm != "default") else f"🏆 已刷: {frac} 次"
         else:
-            txt = "🏆 " + " | ".join(f"{nm}:{cnt}" for nm, cnt in items)
+            parts = []
+            for k, nm, cnt in items:
+                tgt = self._get_target_clears_for_key(k)
+                frac = f"{cnt}/{tgt}" if tgt > 0 else f"{cnt}"
+                parts.append(f"{nm}:{frac}")
+            txt = "🏆 " + " | ".join(parts)
         self.lbl_clear_count.config(text=txt)
 
     def _reset_clear_count(self):
@@ -5912,33 +6311,60 @@ class MeishiBotGUI:
         self._refresh_clear_count_ui()
         self.log(msg)
 
-    def _increment_clear_count(self, ctx=None):
+    def _on_target_clears_reached(self, run_key: str, acc_name: str, cnt: int, tgt: int):
+        """某个账号达到预设目标次数后在主线程优雅收尾 UI 状态（绝不影响其他未达标账号！）"""
+        self._stop_single_bot(run_key, custom_log=(
+            f"🎯 账号【{acc_name or '当前窗口'}】已完成预设目标 {cnt}/{tgt} 次，已自动停止该账号挂机！"
+        ))
+        self._refresh_clear_count_ui()
+
+    def _increment_clear_count(self, ctx=None) -> bool:
+        """为当前账号 +1 刷关计数；若达到该账号预设目标次数，立即停掉该账号并返回 True"""
         key = "default"
         acc_name = ""
+        acc_obj = None
+        run_key = ""
         if ctx:
             key = ctx.get("acc_id") or ctx.get("run_key") or "default"
+            run_key = ctx.get("run_key") or key
             acc_name = ctx.get("acc_name") or ""
+            acc_obj = ctx.get("acc")
         else:
-            cur_k, _, cur_n = self._get_current_run_key()
+            cur_k, cur_acc, cur_n = self._get_current_run_key()
             key = cur_k or "default"
+            run_key = key
             acc_name = cur_n or ""
+            acc_obj = cur_acc
         pfx = self._ctx_prefix(ctx)
         with self._team_lock:
             now = time.time()
             # 按账号独立 15 秒防抖：防止同一号结算动画重复计次，同时不同号同时结算互不影响！
             if now - self._account_last_clear_ts.get(key, 0.0) < 15.0:
-                return
+                return False
             self._account_last_clear_ts[key] = now
             self._last_clear_ts = now
             cnt = self._account_clear_counts.get(key, 0) + 1
             self._account_clear_counts[key] = cnt
             self._account_clear_names[key] = acc_name or key
             self.clear_count = sum(self._account_clear_counts.values())
+        tgt = self._get_target_clears_for_key(key, acc=acc_obj)
         self.root.after(0, self._refresh_clear_count_ui)
         if acc_name:
-            self.log(f"{pfx}🏆 账号【{acc_name}】累计已刷完第 {cnt} 次！")
+            t_str = f"/{tgt}" if tgt > 0 else ""
+            self.log(f"{pfx}🏆 账号【{acc_name}】累计已刷完第 {cnt}{t_str} 次！")
         else:
-            self.log(f"{pfx}🏆 本次累计已刷完第 {cnt} 次！")
+            t_str = f"/{tgt}" if tgt > 0 else ""
+            self.log(f"{pfx}🏆 本次累计已刷完第 {cnt}{t_str} 次！")
+
+        if tgt > 0 and cnt >= tgt:
+            # 立刻作废当前账号 token，防止主线程回调执行前开启下一局
+            with self._runs_lock:
+                rinfo = self._active_runs.get(run_key)
+                if rinfo:
+                    self._active_tokens.discard(rinfo["token"])
+            self.root.after(0, lambda rk=run_key, nm=acc_name, c=cnt, t=tgt: self._on_target_clears_reached(rk, nm, c, t))
+            return True
+        return False
 
     def _get_current_run_key(self):
         """返回当前界面选中账号的唯一运行键、账号对象、账号显示名"""
@@ -5984,7 +6410,7 @@ class MeishiBotGUI:
         if refresh_tree:
             self._reload_accounts_tree()
 
-    def _stop_single_bot(self, run_key: str):
+    def _stop_single_bot(self, run_key: str, custom_log: str = ""):
         """单独停止某一个正在运行的账号，不影响其他并行运行中的账号"""
         with self._runs_lock:
             info = self._active_runs.pop(run_key, None)
@@ -5997,6 +6423,8 @@ class MeishiBotGUI:
                 self.worker_threads = []
         if not info:
             self._refresh_run_buttons()
+            if custom_log:
+                self.log(custom_log)
             return
         with self._team_lock:
             self._team_status.pop(info.get("acc_name", ""), None)
@@ -6008,12 +6436,12 @@ class MeishiBotGUI:
             summary = " | ".join(f"{k}:{v}" for k, v in self._team_status.items())
         self._refresh_run_buttons()
         if rem == 0:
-            self.lbl_bot_progress.config(text="执行进度：已暂停")
-            self.log(f"⏹ 已暂停账号【{info.get('acc_name') or '当前窗口'}】的后台自动闯关。")
+            self.lbl_bot_progress.config(text="执行进度：已达目标自动停止" if custom_log else "执行进度：已暂停")
+            self.log(custom_log or f"⏹ 已暂停账号【{info.get('acc_name') or '当前窗口'}】的后台自动闯关。")
         else:
             hdr = "🤝 联刷中" if self.team_running else "⚡ 运行中"
             self.lbl_bot_progress.config(text=f"{hdr} · {summary}" if summary else f"{hdr} ({rem}号)")
-            self.log(f"⏹ 已单独停止账号【{info.get('acc_name') or '当前窗口'}】，其余 {rem} 个账号继续运行中！")
+            self.log(custom_log or f"⏹ 已单独停止账号【{info.get('acc_name') or '当前窗口'}】，其余 {rem} 个账号继续运行中！")
 
     def _stop_all_bots(self, silent: bool = False):
         """统一彻底停止所有正在运行的单刷/联刷后台线程并恢复按钮状态"""
@@ -6076,6 +6504,18 @@ class MeishiBotGUI:
         if cur_key.startswith("hwnd:"):
             cur_key = f"hwnd:{pinned_hwnd}"
         disp_name = acc_name or f"窗口{pinned_hwnd}"
+        # 若该账号上次已达预设刷关目标，重新启动时自动归零本账号计数方便开新一轮
+        self._on_target_clears_change()
+        tgt_clears = self._get_target_clears_for_key(cur_key, acc=pinned_acc)
+        if tgt_clears > 0:
+            with self._team_lock:
+                prev_cnt = self._account_clear_counts.get(cur_key, 0)
+                if prev_cnt >= tgt_clears:
+                    self._account_clear_counts[cur_key] = 0
+                    self._account_last_clear_ts.pop(cur_key, None)
+                    self.clear_count = sum(self._account_clear_counts.values())
+                    self.log(f"🔄 账号【{disp_name}】上次已达预设目标 {tgt_clears}/{tgt_clears}，本次启动已自动重新计次！")
+            self._refresh_clear_count_ui()
         with self._runs_lock:
             self._run_token += 1
             my_token = self._run_token
@@ -6184,11 +6624,21 @@ class MeishiBotGUI:
                 return
             seen_hwnds[hwnd] = acc["name"]
 
+        self._on_target_clears_change()
         member_ids = [sp[0]["id"] for sp in team_specs if sp[1] == "member"]
         with self._team_lock:
             self._team_member_ids = list(member_ids)
             self._team_member_ready = {mid: False for mid in member_ids}
             self._team_status = {sp[0]["name"]: "启动中" for sp in team_specs}
+            for acc, _, _, _ in team_specs:
+                aid = acc["id"]
+                t_c = self._get_target_clears_for_key(aid, acc=acc)
+                if t_c > 0 and self._account_clear_counts.get(aid, 0) >= t_c:
+                    self._account_clear_counts[aid] = 0
+                    self._account_last_clear_ts.pop(aid, None)
+                    self.log(f"🔄 账号【{acc['name']}】上次已达预设目标 {t_c}/{t_c}，本次启动已自动重新计次！")
+            self.clear_count = sum(self._account_clear_counts.values())
+        self._refresh_clear_count_ui()
 
         threads_to_start = []
         with self._runs_lock:
@@ -6259,8 +6709,26 @@ class MeishiBotGUI:
         last_auto_login_ts = 0.0
         local_latest_fire = None
         has_entered_battle = False
+        battle_fire_locked = False
+        last_auto_fire_try_ts = 0.0
         loop_start_mono = time.perf_counter()
         thresh = float(self.config.get("template_threshold", 0.84))
+
+        def _reset_battle_fire_lock():
+            nonlocal battle_fire_locked, last_auto_fire_try_ts
+            battle_fire_locked = False
+            last_auto_fire_try_ts = 0.0
+            if ctx is not None:
+                ctx["auto_fire_roi"] = None
+
+        def _try_lock_battle_fire(screen_img=None):
+            nonlocal battle_fire_locked, last_auto_fire_try_ts
+            last_auto_fire_try_ts = time.perf_counter()
+            roi, _ = self._auto_lock_fire_roi_for_battle(ctx=ctx, screen=screen_img, save_to_deck=True)
+            if roi is not None:
+                battle_fire_locked = True
+                return True
+            return False
 
         def _set_prog(short_txt: str, full_txt: str = None):
             if is_team or len(self._active_runs) > 1:
@@ -6276,6 +6744,8 @@ class MeishiBotGUI:
             hero_cfg = self._ctx_deck(ctx).get("hero", {})
             if hero_cfg.get("enabled", False) and hero_cfg.get("on_start", False):
                 self._exec_place_hero(wait=False, wait_after=True, token=my_token, ctx=ctx)
+                if self._is_active(my_token):
+                    _try_lock_battle_fire()
 
             while self._is_active(my_token):
                 try:
@@ -6354,6 +6824,9 @@ class MeishiBotGUI:
                                     self.log(f"{pfx}检测到【请放置您的角色】(匹配度={score:.2f})，立刻放置角色！")
                                     _set_prog("放角色")
                                     self._exec_place_hero(wait=False, wait_after=True, token=my_token, ctx=ctx)
+                                    _reset_battle_fire_lock()
+                                    if self._is_active(my_token):
+                                        _try_lock_battle_fire()
                                     place_idx = 0
                                     first_pass_done = False
                                     repair_state.clear()
@@ -6367,13 +6840,17 @@ class MeishiBotGUI:
                                 if resets:
                                     self.log(f"{pfx}检测到【继续战斗】(匹配度={score:.2f})，后台点击 ({cx}, {cy})（已开启重摆：准备进入下一局）")
                                     bg_click(hwnd, cx, cy)
-                                    self._increment_clear_count(ctx=ctx)
+                                    if self._increment_clear_count(ctx=ctx):
+                                        break
                                     place_idx = 0
                                     first_pass_done = False
+                                    _reset_battle_fire_lock()
                                     _set_prog("继续→重摆")
                                     h_cfg = cur_deck.get("hero", {})
                                     if h_cfg.get("enabled", False) and h_cfg.get("on_continue", True):
                                         self._wait_battle_and_place_hero(tpl_hero, max_wait=45.0, token=my_token, ctx=ctx)
+                                        if self._is_active(my_token):
+                                            _try_lock_battle_fire()
                                     else:
                                         self._sleep_interruptible(2.0, my_token)
                                 else:
@@ -6394,10 +6871,12 @@ class MeishiBotGUI:
                                 _set_prog("结算收尾")
                                 self._exec_finish_sequence(token=my_token, ctx=ctx)
                                 if self._is_active(my_token):
-                                    self._increment_clear_count(ctx=ctx)
+                                    if self._increment_clear_count(ctx=ctx):
+                                        break
                                 place_idx = 0
                                 first_pass_done = False
                                 repair_state.clear()
+                                _reset_battle_fire_lock()
                                 last_stage_scan_ts = 0.0
                                 self._sleep_interruptible(2.0, my_token)
                                 if self._is_active(my_token):
@@ -6419,6 +6898,7 @@ class MeishiBotGUI:
                                     place_idx = 0
                                     first_pass_done = False
                                     repair_state.clear()
+                                    _reset_battle_fire_lock()
                                     last_stage_scan_ts = 0.0
                                     self._sleep_interruptible(2.5, my_token)
                                     if self._is_active(my_token):
@@ -6454,6 +6934,7 @@ class MeishiBotGUI:
                                     place_idx = 0
                                     first_pass_done = False
                                     repair_state.clear()
+                                    _reset_battle_fire_lock()
                                     last_stage_scan_ts = 0.0
                                     self._sleep_interruptible(2.5, my_token)
                                     continue
@@ -6505,10 +6986,13 @@ class MeishiBotGUI:
                                     place_idx = 0
                                     first_pass_done = False
                                     repair_state.clear()
+                                    _reset_battle_fire_lock()
                                     last_stage_scan_ts = 0.0
                                     h_cfg = cur_deck.get("hero", {})
                                     if h_cfg.get("enabled", False) and self._is_active(my_token):
                                         self._wait_battle_and_place_hero(tpl_hero, max_wait=45.0, token=my_token, ctx=ctx)
+                                        if self._is_active(my_token):
+                                            _try_lock_battle_fire()
                                     else:
                                         self._sleep_interruptible(1.5, my_token)
                                     continue
@@ -6516,8 +7000,10 @@ class MeishiBotGUI:
                     if not self._is_active(my_token):
                         break
 
-                    # 4. 战斗内极速按序放卡（第 1 轮严格按序；第 2 轮起若开启【🔁三层智能补阵】则按 基础→辅助→主力 极速巡检补种！）
+                    # 4. 战斗内极速按序放卡（每局进战斗先自动锁定火苗位置；第 1 轮按序放卡，第 2 轮起三层智能补阵！）
                     if actively_placing:
+                        if not battle_fire_locked and (time.perf_counter() - last_auto_fire_try_ts >= 0.65):
+                            _try_lock_battle_fire()
                         if first_pass_done and loop_mode:
                             r_ret = self._exec_smart_repair_burst(
                                 my_token, ctx, cur_deck, active_steps, repair_state, _set_prog, max_slice_s=0.45
